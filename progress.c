@@ -69,6 +69,7 @@
 
 // Given -a will dynamically add values to this list, move it to be a dynamic
 // list and generate it at runtime.
+struct winsize ws;
 static int proc_names_cnt;
 static char **proc_names;
 char *default_proc_names[] = {"cp", "mv", "dd", "tar", "bsdtar", "cat", "rsync", "scp",
@@ -90,6 +91,17 @@ char *default_proc_names[] = {"cp", "mv", "dd", "tar", "bsdtar", "cat", "rsync",
     NULL
 };
 
+typedef struct id{
+    int pid;
+    char name[MAXPATHLEN + 1];
+    char loc[MAXPATHLEN + 1];
+    float perc;
+    char fpos[64];
+    char fsize[64];
+    time_t eta;
+    char ftroughput[64];
+} id;
+
 // static means initialized to 0/NULL (C standard, §6.7.8/10)
 static int proc_specifiq_name_cnt;
 static char **proc_specifiq_name;
@@ -105,6 +117,12 @@ signed char flag_monitor = 0;
 signed char flag_monitor_continuous = 0;
 signed char flag_open_mode = 0;
 double throughput_wait_secs = 1;
+
+signed char order_by_pid=1;
+signed char descending=0;
+signed char order_by_eta=0;
+signed char one_by_one=0;
+signed char order_by_perc=0;
 
 WINDOW *mainwin;
 
@@ -720,21 +738,25 @@ fclose(fp);
 return 1;
 }
 
-void print_bar(float perc, int char_available)
+void print_bar(float perc, int max_size)
 {
-int i;
-int num;
+    const char bar = '=';
+    const char blank = ' ';
+    const char tip = '>';
 
-num = (char_available / 100.0) * perc;
+    int i;
+    int tick;
+    int max = max_size-2;
+    tick = (max / 100.0) * perc;
 
-for (i = 0 ; i < num-1 ; i++) {
-    putchar('=');
-}
-putchar('>');
-i++;
+    for (i = 0 ; i < tick-1 ; i++) {
+        printf("%c",bar);
+    }
+    printf("%c",tip);
+    i++;
 
-for ( ; i < char_available ; i++)
-    putchar(' ');
+    for ( ; i < max ; i++)
+        printf("%c",blank);
 
 }
 
@@ -742,9 +764,14 @@ for ( ; i < char_available ; i++)
 void parse_options(int argc, char *argv[])
 {
 static struct option long_options[] = {
+    {"timeline",             no_argument,       0, 't'},//옵션  추가
+    {"timeline-remove",      no_argument,       0, 'T'},//옵션 추가
     {"version",              no_argument,       0, 'v'},
+    {"process-one-by-one",   no_argument,       0, 'b'},
     {"quiet",                no_argument,       0, 'q'},
     {"debug",                no_argument,       0, 'd'},
+    {"descending",           no_argument,       0, 's'},
+    {"order-by-eta",         no_argument,       0, 'e'},
     {"wait",                 no_argument,       0, 'w'},
     {"wait-delay",           required_argument, 0, 'W'},
     {"monitor",              no_argument,       0, 'm'},
@@ -755,10 +782,12 @@ static struct option long_options[] = {
     {"pid",                  required_argument, 0, 'p'},
     {"ignore-file",          required_argument, 0, 'i'},
     {"open-mode",            required_argument, 0, 'o'},
+
     {0, 0, 0, 0}
 };
 
-static char *options_string = "vqdwmMha:c:p:W:i:o:";
+static char *options_string = "TtvqdwmMhra:c:p:W:i:o:";//옵션 추가
+
 int c,i;
 int option_index = 0;
 char *rp;
@@ -773,6 +802,23 @@ while(1) {
         break;
 
     switch (c) {
+        case 'T'://타임라인 삭제
+        timeline=fopen("timeline.txt","w");
+        fclose(timeline);
+        exit(EXIT_SUCCESS);
+
+        case 't'://타임라인 읽기
+            timeline=fopen("timeline.txt","r");
+            char buffer[1024];
+
+        if(timeline==NULL)
+            printf("no file or not opened");
+            for(;;){
+        if(fgets(buffer, sizeof(buffer), timeline)==NULL) break;
+            printf("%s",buffer);}
+            fclose(timeline);
+            exit(EXIT_SUCCESS); 
+
         case 'v':
             printf("progress version %s\n", PROGRESS_VERSION);
             exit(EXIT_SUCCESS);
@@ -799,10 +845,38 @@ while(1) {
             printf("  -i --ignore-file file        do not report process if using file\n");
             printf("  -o --open-mode {r|w}         report only files opened for read or write\n");
             printf("  -v --version                 show program version and exit\n");
+            printf("  -t --timeline          show coreutils timeline while monitoring\n"); //명령어 설명 추가
+            printf("  -T --timeline-remove       remove timeline\n");//명령어 설명 추가
             printf("  -h --help                    display this help and exit\n");
+            printf("  -s --descending              print by descending\n");
+            printf("  -e --order by eta            order by eta\n");
+            printf("  -r --order by perc           order by perc\n");
+            printf("  -b --process one by one      process one by one\n");
             printf("\n\n");
             printf("Multiple options allowed for: -a -c -p -i. Use PROGRESS_ARGS for permanent arguments.\n");
             exit(EXIT_SUCCESS);
+            break;
+
+        case 'r':
+            order_by_pid=0;
+            order_by_perc=1;
+        case 'b':
+            order_by_pid=0;
+            one_by_one=1;
+            flag_monitor = 1;
+            flag_throughput = 1;
+            order_by_eta=1;
+            break;
+
+
+        case 'e':
+            flag_throughput = 1;
+            order_by_pid=0;
+            order_by_eta=1;
+            break;
+
+        case 's':
+            descending=1;
             break;
 
         case 'q':
@@ -886,6 +960,180 @@ if (optind < argc) {
 
 }
 
+int compare_eta_by_ascending(const void *ids_a, const void *ids_b){
+    int num1=((id *)ids_a)->eta;
+    int num2=((id *)ids_b)->eta;
+    if (num1 < num2)    
+        return -1;      
+
+    if (num1 > num2)    
+        return 1;     
+
+    return 0;
+}
+
+int compare_eta_by_descending(const void *ids_a, const void *ids_b){
+    int num1=((id *)ids_a)->eta;
+    int num2=((id *)ids_b)->eta;
+    if (num1 > num2)    
+        return -1;      
+
+    if (num1 < num2)    
+        return 1;     
+
+    return 0;
+}
+int cnt=0;
+void print_by_remain_eta_descending(int size_ids,id *ids){
+    
+    qsort(ids,size_ids,sizeof(id),compare_eta_by_descending);
+    for(int i=0;i<size_ids;i++){
+
+        nprintf("[%5d] %s %s\n\t%.1f%% (%s / %s)",
+        (ids+i)->pid,
+        (ids+i)->name,
+        (ids+i)->loc,
+        (ids+i)->perc,
+        (ids+i)->fpos,
+        (ids+i)->fsize);
+        nprintf(" %s/s", (ids+i)->ftroughput);
+        print_eta((ids+i)->eta);
+        nprintf("\n\n");
+    }
+}
+
+void print_by_remain_eta_ascending(int size_ids,id *ids){
+    
+    qsort(ids,size_ids,sizeof(id),compare_eta_by_ascending);
+    nprintf("ids size is %d",size_ids);
+    for(int i=0;i<size_ids;i++){
+
+        nprintf("[%5d] %s %s\n\t%.1f%% (%s / %s)",
+        (ids+i)->pid,
+        (ids+i)->name,
+        (ids+i)->loc,
+        (ids+i)->perc,
+        (ids+i)->fpos,
+        (ids+i)->fsize);
+        nprintf(" %s/s", (ids+i)->ftroughput);
+        print_eta((ids+i)->eta);
+        nprintf("\n\n");
+    }
+    if(one_by_one==1){
+        cnt++;
+        if(cnt>3){
+        process_one_by_one(size_ids,ids);}
+    }
+
+}
+
+void process_one_by_one(int size_ids,id *ids){
+    int stopped =0;
+    for(int i=0;i<size_ids;i++){
+           if(0== strcmp((ids+i)->ftroughput, "0"))
+           stopped++;
+        }
+    nprintf("this is on by one\n");
+    
+    if(size_ids-stopped==1){ //경우 5
+        return 0;
+    }
+    else if(size_ids==1&&stopped==1){ //경우 4
+        nprintf("case 4");
+        char cmd[100];
+            sprintf(cmd,"kill -18 %d",(ids)->pid);
+            nprintf("%s \n",cmd);
+            nprintf("%s",cmd);
+            system(cmd);
+        }
+    else if(size_ids==stopped){  //경우 경우 2 모두 다 킨다
+        for(int i=0;i<size_ids;i++){
+;
+            char cmd[100];
+            sprintf(cmd,"kill -18 %d",(ids+i)->pid);
+            nprintf("%s",cmd);
+            system(cmd);
+            } 
+             cnt=0;
+    }
+    else if(size_ids>1&&size_ids-stopped>1) {//경우 3
+    nprintf("case 3");
+        for(int i=1;i<size_ids-stopped;i++){
+            char cmd[100];
+            sprintf(cmd,"kill -tstp %d",(ids+i)->pid);
+            
+            nprintf("%s",cmd);
+            system(cmd);
+        } 
+        cnt=0;
+    }
+}
+
+int compare_perc_by_ascending(const void *ids_a, const void *ids_b){
+    int num1=((id *)ids_a)->perc;
+    int num2=((id *)ids_b)->perc;
+    if (num1 < num2)    
+        return -1;      
+
+    if (num1 > num2)    
+        return 1;     
+
+    return 0;
+}
+
+int compare_perc_by_descending(const void *ids_a, const void *ids_b){
+    int num1=((id *)ids_a)->perc;
+    int num2=((id *)ids_b)->perc;
+    if (num1 > num2)    
+        return -1;      
+
+    if (num1 < num2)    
+        return 1;     
+
+    return 0;
+}
+
+void print_by_remain_perc_descending(int size_ids,id *ids){
+    
+    qsort(ids,size_ids,sizeof(id),compare_perc_by_descending);
+    for(int i=0;i<size_ids;i++){
+
+        nprintf("[%5d] %s %s\n\t%.1f%% (%s / %s)",
+        (ids+i)->pid,
+        (ids+i)->name,
+        (ids+i)->loc,
+        (ids+i)->perc,
+        (ids+i)->fpos,
+        (ids+i)->fsize);
+        if(flag_throughput == 1){
+        nprintf(" %s/s", (ids+i)->ftroughput);
+        print_eta((ids+i)->eta);}
+        nprintf("\n\n");
+    }
+}
+
+void print_by_remain_perc_ascending(int size_ids,id *ids){
+    
+    qsort(ids,size_ids,sizeof(id),compare_perc_by_ascending);
+    for(int i=0;i<size_ids;i++){
+
+        nprintf("[%5d] %s %s\n\t%.1f%% (%s / %s)",
+        (ids+i)->pid,
+        (ids+i)->name,
+        (ids+i)->loc,
+        (ids+i)->perc,
+        (ids+i)->fpos,
+        (ids+i)->fsize);
+        if(flag_throughput == 1){
+        nprintf(" %s/s", (ids+i)->ftroughput);
+        print_eta((ids+i)->eta);}
+        nprintf("\n\n");
+    }
+    
+
+}
+
+
 void print_eta(time_t seconds)
 {
 struct tm *p;
@@ -947,6 +1195,12 @@ result_t results[MAX_RESULTS];
 signed char still_there;
 signed char search_all = 1;
 static signed char first_pass = 1;
+timeline=fopen("timeline.txt","a+");//파일 불러오기
+int flag;//중복 확인용 변수
+char buffer[128];//파일 읽기 용 
+char command[128];//명령어용
+
+
 
 pid_count = 0;
 if (!flag_monitor && !flag_monitor_continuous)
@@ -998,7 +1252,7 @@ if (!pid_count) {
         return 0;
     if (flag_monitor || flag_monitor_continuous) {
         clear();
-	refresh();
+   refresh();
     }
     if (proc_specifiq_pid_cnt) {
         nfprintf(stderr, "No such pid: ");
@@ -1025,6 +1279,8 @@ if (!pid_count) {
 }
 
 result_count = 0;
+
+
 
 for (i = 0 ; i < pid_count ; i++) {
     fd_count = find_fd_for_pid(pidinfo_list[i].pid, fdnum_list, MAX_FD_PER_PID);
@@ -1071,6 +1327,7 @@ if (flag_throughput && !first_pass)
 if (flag_monitor || flag_monitor_continuous) {
     clear();
 }
+id ids[result_count];
 copy_and_clean_results(results, result_count, 1);
 for (i = 0 ; i < result_count ; i++) {
 
@@ -1093,7 +1350,7 @@ for (i = 0 ; i < result_count ; i++) {
         perc = ((double)100 / (double)fdinfo.size) * (double)fdinfo.pos;
 
     }
-
+    if(order_by_pid==1){
     nprintf("[%5d] %s %s\n\t%.1f%% (%s / %s)",
         results[i].pid.pid,
         results[i].pid.name,
@@ -1101,6 +1358,33 @@ for (i = 0 ; i < result_count ; i++) {
         perc,
         fpos,
         fsize);
+        }
+    else{
+        ids[i].pid=results[i].pid.pid;
+        strcpy(ids[i].name,results[i].pid.name);
+        strcpy(ids[i].loc, results[i].fd.name);
+        ids[i].perc=perc;
+        strcpy(ids[i].fpos,fpos);
+        strcpy(ids[i].fsize,fsize);
+        }
+
+    sprintf(command,"[%5d] %s %s\n", //명령어 command 에 복사
+        results[i].pid.pid,
+        results[i].pid.name,
+        results[i].fd.name);
+
+    flag=1;   //flag 초기화
+    
+    for (;;) {
+        if (fgets(buffer, sizeof(buffer), timeline) == NULL)//중복 체크
+            break;
+        flag = strcmp(buffer, command);
+        if(flag==0)
+      break;
+    }
+
+    if(flag!=0)
+       fprintf(timeline,command);//명령어 타임라인 삽입
 
     if (flag_throughput && still_there && !first_pass) {
         // results[i] vs fdinfo
@@ -1115,20 +1399,49 @@ for (i = 0 ; i < result_count ; i++) {
         bytes_per_sec = get_hlist_average(results[i].hbegin, results[i].hsize);
 
         format_size(bytes_per_sec, ftroughput);
+        
+        if (order_by_pid==1)
+        {
         nprintf(" %s/s", ftroughput);
+        }
+        else
+        {
+            strcpy(ids[i].ftroughput,ftroughput);
+        }
         if (bytes_per_sec && fdinfo.size - fdinfo.pos >= 0) {
-            print_eta((fdinfo.size - fdinfo.pos) / bytes_per_sec);
+            if (order_by_pid==1){
+                print_eta((fdinfo.size - fdinfo.pos) / bytes_per_sec);}
+            else{
+            ids[i].eta=(fdinfo.size - fdinfo.pos) / bytes_per_sec;}
         }
     }
-
-
+    
+         if (order_by_pid==1)
+        {
+        nprintf("\n\n");
+        }
+        
     nprintf("\n\n");
-
-    // Need to work on window width when using screen/watch/...
-    //~ printf("    [");
-    //~ print_bar(perc, ws.ws_col-6);
-    //~ printf("]\n");
+    printf("  [");
+    print_bar(perc, ws.ws_col-4);
+    printf("]\n");
 }
+if ((order_by_pid==0&&descending==0&&order_by_eta==1&&order_by_perc==0)||(order_by_pid==0&&descending==0&&one_by_one==1&&order_by_perc==0))
+{
+    print_by_remain_eta_ascending(result_count,&ids);
+}
+else if(order_by_pid==0&&descending==1&&order_by_eta==1&&order_by_perc==0){
+    print_by_remain_eta_descending(result_count,&ids);
+}
+else if ((order_by_pid==0&&descending==0&&order_by_perc==1))
+{
+    print_by_remain_perc_ascending(result_count,&ids);
+}
+else if(order_by_pid==0&&descending==1&&order_by_perc==1){
+    print_by_remain_perc_descending(result_count,&ids);
+}
+
+
 if (flag_monitor || flag_monitor_continuous) {
     if (!result_count)
         nprintf("No PID(s) currently monitored\n");
@@ -1157,10 +1470,10 @@ void populate_proc_names() {
     }
 }
 
+
 int main(int argc, char *argv[])
 {
 pid_t nb_pid;
-struct winsize ws;
 wordexp_t env_wordexp;
 char *env_progress_args;
 char *env_progress_args_full;
@@ -1188,7 +1501,7 @@ if (env_progress_args) {
 parse_options(argc,argv);
 
 // ws.ws_row, ws.ws_col
-ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
+ioctl(0, TIOCGWINSZ, &ws);
 if (flag_monitor || flag_monitor_continuous) {
     setlocale(LC_CTYPE, "");
     if ((mainwin = initscr()) == NULL ) {

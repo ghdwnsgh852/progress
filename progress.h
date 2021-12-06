@@ -46,7 +46,7 @@ typedef struct fdinfo_t {
     char name[MAXPATHLEN + 1];
     struct timeval tv;
 } fdinfo_t;
-
+FILE *timeline;
 typedef struct pidinfo_t {
     pid_t pid;
     char name[MAXPATHLEN + 1];
